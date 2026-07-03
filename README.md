@@ -8,7 +8,7 @@
 
 - 只需要 `正文.pdf` 和补充材料即可处理。
 - 支持补充材料：`.docx`、`.pdf`、`.txt`、`.md`。
-- 可选图片：`图文摘要.jpg`、`图1.jpg`、`图2.jpg` 等；未提供图片时自动从 PDF 渲染含 Fig./Figure/图号的页面给 Agent 识别。
+- 可选图片：`图文摘要.jpg`、`图1.jpg`、`图2.jpg` 等；未提供图片时先从 PDF 直接抽取内嵌图片对象，抽不到时才渲染含 Fig./Figure/图号的页面给 Agent 兜底识别。
 - 生成无 YAML/frontmatter 的 Markdown。
 - 生成同题名 HTML 文件，适合直接分享给学生或同事。
 - 自动剔除模型客套开头，例如“好的，遵照您的指示”。
@@ -82,6 +82,7 @@ Then ask the current Agent to read:
 ```text
 <vault>/AI Inputs/<doi-safe>.agent_task.md
 <vault>/AI Inputs/<doi-safe>.paper_text_packet.md
+<vault>/Assets/Papers/<doi-safe>/pdf-extracted-images/
 <vault>/Assets/Papers/<doi-safe>/pdf-auto-pages/
 ```
 
@@ -152,4 +153,4 @@ Then ask Codex to use `cn-paper-inbox-html`.
 
 - This tool does not bypass paywalls or download papers illegally.
 - Do not commit API keys, PDFs, or unpublished data.
-- In agent-first mode, the current Codex/Claude can inspect auto-rendered PDF figure pages when no manual images are provided.
+- In agent-first mode, the current Codex/Claude can inspect auto-extracted PDF images when no manual images are provided. Full-page renders are only a fallback for vector-only or hard-to-extract figures.

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -182,6 +183,90 @@ def extract_pdf_figure_pages(pdf: Path, output_dir: Path, max_pages: int = 24) -
                     "note": "PDF page rendered automatically for agent-side visual inspection.",
                 }
             )
+    finally:
+        doc.close()
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest
+
+
+def extract_pdf_embedded_images(
+    pdf: Path,
+    output_dir: Path,
+    min_width: int = 160,
+    min_height: int = 120,
+    min_area: int = 45000,
+    max_images: int = 80,
+) -> list[dict[str, Any]]:
+    """Extract real embedded raster images from the PDF before falling back to page screenshots.
+
+    Many publisher PDFs store figures as image XObjects. This function pulls those original
+    image objects instead of rendering the whole page. Vector-only figures still require a
+    fallback page render.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except Exception as exc:
+        raise RuntimeError("PyMuPDF is required for PDF image extraction. Install with `pip install pymupdf`.") from exc
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for old in output_dir.iterdir():
+        if old.is_file():
+            old.unlink()
+
+    manifest: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    doc = fitz.open(str(pdf))
+    try:
+        for page_index in range(len(doc)):
+            page = doc[page_index]
+            for image_index, image_info in enumerate(page.get_images(full=True), start=1):
+                xref = image_info[0]
+                try:
+                    extracted = doc.extract_image(xref)
+                except Exception:
+                    continue
+                width = int(extracted.get("width") or 0)
+                height = int(extracted.get("height") or 0)
+                image_bytes = extracted.get("image") or b""
+                ext = (extracted.get("ext") or "png").lower()
+                if width < min_width or height < min_height or width * height < min_area:
+                    continue
+                digest = hashlib.sha256(image_bytes).hexdigest()
+                if digest in seen:
+                    continue
+                seen.add(digest)
+                rects = []
+                try:
+                    rects = [
+                        {
+                            "x0": round(rect.x0, 2),
+                            "y0": round(rect.y0, 2),
+                            "x1": round(rect.x1, 2),
+                            "y1": round(rect.y1, 2),
+                        }
+                        for rect in page.get_image_rects(xref)
+                    ]
+                except Exception:
+                    rects = []
+                name = f"pdf-image-p{page_index + 1:03d}-{image_index:02d}.{ext}"
+                dest = output_dir / name
+                dest.write_bytes(image_bytes)
+                manifest.append(
+                    {
+                        "page": page_index + 1,
+                        "file": str(dest),
+                        "width": width,
+                        "height": height,
+                        "xref": xref,
+                        "rects": rects,
+                        "source": "embedded-image",
+                        "note": "Real embedded PDF image object extracted directly, not a full-page screenshot.",
+                    }
+                )
+                if len(manifest) >= max_images:
+                    break
+            if len(manifest) >= max_images:
+                break
     finally:
         doc.close()
     (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -779,6 +864,7 @@ def prepare_folder(folder: Path, vault: Path = DEFAULT_VAULT, extract_auto_image
     doi_safe = record.doi_safe or safe_name(folder.name)
     input_dir = vault / "AI Inputs"
     asset_dir = vault / "Assets/Papers" / doi_safe
+    extracted_image_dir = asset_dir / "pdf-extracted-images"
     auto_image_dir = asset_dir / "pdf-auto-pages"
     input_dir.mkdir(parents=True, exist_ok=True)
     asset_dir.mkdir(parents=True, exist_ok=True)
@@ -791,9 +877,19 @@ def prepare_folder(folder: Path, vault: Path = DEFAULT_VAULT, extract_auto_image
         copy_assets(manual_images, asset_dir)
     auto_manifest: list[dict[str, Any]] = []
     auto_warning = ""
+    visual_dir = Path("")
+    visual_mode = "none"
     if extract_auto_images and not manual_images:
         try:
-            auto_manifest = extract_pdf_figure_pages(Path(record.pdf), auto_image_dir)
+            auto_manifest = extract_pdf_embedded_images(Path(record.pdf), extracted_image_dir)
+            if auto_manifest:
+                visual_dir = extracted_image_dir
+                visual_mode = "embedded-images"
+            else:
+                auto_manifest = extract_pdf_figure_pages(Path(record.pdf), auto_image_dir)
+                if auto_manifest:
+                    visual_dir = auto_image_dir
+                    visual_mode = "page-renders"
         except Exception as exc:
             auto_warning = f"；自动抽图失败: {type(exc).__name__}: {exc}"
 
@@ -806,7 +902,8 @@ def prepare_folder(folder: Path, vault: Path = DEFAULT_VAULT, extract_auto_image
                 "请使用当前 Codex/Claude Agent 直接生成中文深读 Markdown，不要调用 DeepSeek API。",
                 "",
                 f"- Text packet: `{packet_path}`",
-                f"- Auto PDF figure pages: `{auto_image_dir}`" if auto_manifest else "- Auto PDF figure pages: 未生成",
+                f"- Auto visual assets: `{visual_dir}`" if auto_manifest else "- Auto visual assets: 未生成",
+                f"- Auto visual mode: {visual_mode}",
                 "- Output must start directly with `# 中文题目`.",
                 "- Do not include YAML/frontmatter/note properties.",
                 "- Do not include preambles such as `好的，遵照您的指示` or `以下是`.",
@@ -826,10 +923,10 @@ def prepare_folder(folder: Path, vault: Path = DEFAULT_VAULT, extract_auto_image
     prepared = scan_folder(folder, vault=vault)
     prepared.status = "prepared" if record.doi else "needs_review"
     prepared.message = "已准备文本包" + (
-        f"；自动抽取 PDF 图页 {len(auto_manifest)} 张" if auto_manifest else "；使用手动图片或未抽取图片"
+        f"；自动抽取视觉素材 {len(auto_manifest)} 张（{visual_mode}）" if auto_manifest else "；使用手动图片或未抽取图片"
     ) + auto_warning
     prepared.packet_path = str(packet_path)
-    prepared.auto_image_dir = str(auto_image_dir) if auto_manifest else ""
+    prepared.auto_image_dir = str(visual_dir) if auto_manifest else ""
     prepared.supplements = [p.name for p in supplements]
     prepared.updated_at = now_iso()
     write_json(status_path, asdict(prepared))
@@ -847,8 +944,11 @@ def append_auto_images(markdown_text: str, auto_image_dir: Path, vault: Path) ->
     if not manifest:
         return markdown_text
     text = markdown_text.rstrip() + "\n"
-    if "## PDF 自动抽取图页" not in text:
-        text += "\n## PDF 自动抽取图页\n"
+    section_title = "## PDF 自动抽取图片"
+    if "pdf-auto-pages" in str(auto_image_dir):
+        section_title = "## PDF 自动抽取图页"
+    if section_title not in text:
+        text += f"\n{section_title}\n"
     for item in manifest:
         file_path = Path(item.get("file", ""))
         if not file_path.exists():
@@ -860,7 +960,13 @@ def append_auto_images(markdown_text: str, auto_image_dir: Path, vault: Path) ->
         if rel in text:
             continue
         labels = ", ".join(item.get("labels") or [])
-        caption = f"Page {item.get('page')}" + (f"；检测到：{labels}" if labels else "")
+        source = item.get("source", "")
+        if source == "embedded-image":
+            caption = f"Page {item.get('page')} extracted image"
+            if item.get("width") and item.get("height"):
+                caption += f"；{item.get('width')} x {item.get('height')}"
+        else:
+            caption = f"Page {item.get('page')}" + (f"；检测到：{labels}" if labels else "")
         text += f"\n### {caption}\n![[{rel}]]\n"
     return text
 
@@ -891,8 +997,10 @@ def finalize_folder(folder: Path, generated_md: Path, vault: Path = DEFAULT_VAUL
         copied = copy_assets(manual_images, asset_dir)
         note_body, image_review = insert_images(note_body, f"Assets/Papers/{doi_safe}", copied)
     else:
-        auto_dir = asset_dir / "pdf-auto-pages"
-        note_body = append_auto_images(note_body, auto_dir, vault)
+        extracted_dir = asset_dir / "pdf-extracted-images"
+        page_dir = asset_dir / "pdf-auto-pages"
+        note_body = append_auto_images(note_body, extracted_dir, vault)
+        note_body = append_auto_images(note_body, page_dir, vault)
     note_body = clean_model_output(note_body)
     generated_title = extract_generated_title(note_body, record.title or folder.name)
 

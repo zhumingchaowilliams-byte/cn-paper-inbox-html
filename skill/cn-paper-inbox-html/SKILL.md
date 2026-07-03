@@ -1,6 +1,6 @@
 ---
 name: cn-paper-inbox-html
-description: Portable Chinese paper inbox workflow for environmental materials, water treatment, and pollution-control papers. Use when Codex needs to process folders containing only a main paper PDF and supplementary materials, auto-extract PDF figure pages when images are missing, generate Chinese deep-reading notes with the current agent's own token budget, export polished HTML, avoid YAML/frontmatter note properties, or package the workflow for students and collaborators.
+description: Portable Chinese paper inbox workflow for environmental materials, water treatment, and pollution-control papers. Use when Codex needs to process folders containing only a main paper PDF and supplementary materials, auto-extract embedded PDF images or fallback figure pages when images are missing, generate Chinese deep-reading notes with the current agent's own token budget, export polished HTML, avoid YAML/frontmatter note properties, or package the workflow for students and collaborators.
 ---
 
 # 中文文献投递箱 HTML
@@ -25,7 +25,7 @@ Optional manually named images are supported but not required:
   图2.jpg
 ```
 
-Also support `supplements\` and `figures\` subfolders. If no manual images are provided, run `--prepare`; the script renders PDF pages containing Fig./Figure/图号 labels into `<vault>\Assets\Papers\<doi-safe>\pdf-auto-pages\` for agent-side visual inspection.
+Also support `supplements\` and `figures\` subfolders. If no manual images are provided, run `--prepare`; the script first extracts real embedded PDF image objects into `<vault>\Assets\Papers\<doi-safe>\pdf-extracted-images\`. If no usable embedded images are found, it falls back to rendering PDF pages containing Fig./Figure/图号 labels into `<vault>\Assets\Papers\<doi-safe>\pdf-auto-pages\`.
 
 ## Output Rules
 
@@ -45,7 +45,7 @@ Recommended agent-first flow:
 python scripts/process_paper_inbox.py --inbox <inbox> --vault <vault> --prepare <folder-name>
 ```
 
-Then read `<vault>\AI Inputs\<doi-safe>.agent_task.md`, the generated text packet, and, if present, inspect the rendered PDF figure pages. Write the Chinese note yourself as Markdown, starting directly with `# 标题`. Save it to a temporary `.md` file, then finalize:
+Then read `<vault>\AI Inputs\<doi-safe>.agent_task.md`, the generated text packet, and, if present, inspect extracted PDF images or fallback rendered PDF figure pages. Write the Chinese note yourself as Markdown, starting directly with `# 标题`. Save it to a temporary `.md` file, then finalize:
 
 ```bash
 python scripts/process_paper_inbox.py --inbox <inbox> --vault <vault> --finalize <folder-name> --generated-md <generated-note.md>

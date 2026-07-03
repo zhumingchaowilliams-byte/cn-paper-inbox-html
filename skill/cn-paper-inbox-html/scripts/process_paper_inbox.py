@@ -42,6 +42,8 @@ class PaperRecord:
     image_review: list[str] | None = None
     note_path: str = ""
     html_path: str = ""
+    packet_path: str = ""
+    auto_image_dir: str = ""
     updated_at: str = ""
 
 
@@ -129,6 +131,61 @@ def missing_figures(images: dict[str, Path]) -> list[str]:
         return []
     present = set(nums)
     return [f"图{i}" for i in range(1, max(nums) + 1) if i not in present]
+
+
+def figure_page_candidates(pdf: Path) -> list[tuple[int, list[str]]]:
+    import pdfplumber
+
+    candidates: list[tuple[int, list[str]]] = []
+    pattern = re.compile(r"(?:Fig\.?|Figure|图)\s*\d+[A-Za-z]?", re.I)
+    with pdfplumber.open(str(pdf)) as doc:
+        for index, page in enumerate(doc.pages, start=1):
+            text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
+            matches = sorted(set(match.group(0) for match in pattern.finditer(text)))
+            if matches:
+                candidates.append((index, matches))
+    return candidates
+
+
+def extract_pdf_figure_pages(pdf: Path, output_dir: Path, max_pages: int = 24) -> list[dict[str, Any]]:
+    """Render pages that appear to contain figures so an agent can inspect them visually."""
+    try:
+        import fitz  # PyMuPDF
+    except Exception as exc:
+        raise RuntimeError("PyMuPDF is required for automatic PDF image extraction. Install with `pip install pymupdf`.") from exc
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for old in output_dir.glob("*.png"):
+        old.unlink()
+
+    candidates = figure_page_candidates(pdf)
+    if not candidates:
+        candidates = [(index, []) for index in range(1, min(max_pages, 6) + 1)]
+    candidates = candidates[:max_pages]
+
+    manifest: list[dict[str, Any]] = []
+    doc = fitz.open(str(pdf))
+    try:
+        zoom = 2.0
+        matrix = fitz.Matrix(zoom, zoom)
+        for page_number, labels in candidates:
+            page = doc[page_number - 1]
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            name = f"pdf-page-{page_number:03d}.png"
+            dest = output_dir / name
+            pix.save(str(dest))
+            manifest.append(
+                {
+                    "page": page_number,
+                    "file": str(dest),
+                    "labels": labels,
+                    "note": "PDF page rendered automatically for agent-side visual inspection.",
+                }
+            )
+    finally:
+        doc.close()
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest
 
 
 def extract_pdf_metadata(pdf: Path) -> tuple[int, str, str, str]:
@@ -664,8 +721,12 @@ def scan_folder(folder: Path, vault: Path = DEFAULT_VAULT) -> PaperRecord:
     doi_safe = doi_to_safe(doi) if doi else safe_name(folder.name)
     stored_note = status_data.get("note_path", "")
     stored_html = status_data.get("html_path", "")
+    stored_packet = status_data.get("packet_path", "")
+    stored_auto_image_dir = status_data.get("auto_image_dir", "")
     note_path = Path(stored_note) if stored_note else vault / "Knowledge/Paper Deep Readings" / f"{doi_safe} - polished.md"
     html_path = Path(stored_html) if stored_html else vault / "Knowledge/Paper Deep Readings HTML" / f"{doi_safe} - polished.html"
+    packet_path = Path(stored_packet) if stored_packet else vault / "AI Inputs" / f"{doi_safe}.paper_text_packet.md"
+    auto_image_dir = Path(stored_auto_image_dir) if stored_auto_image_dir else vault / "Assets/Papers" / doi_safe / "pdf-auto-pages"
     status = status_data.get("status") or ("done" if note_path.exists() else "new")
     if not doi and status == "new":
         status = "needs_review"
@@ -688,6 +749,8 @@ def scan_folder(folder: Path, vault: Path = DEFAULT_VAULT) -> PaperRecord:
         image_review=status_data.get("image_review", []),
         note_path=str(note_path) if note_path.exists() else "",
         html_path=str(html_path) if html_path.exists() else "",
+        packet_path=str(packet_path) if packet_path.exists() else "",
+        auto_image_dir=str(auto_image_dir) if auto_image_dir.exists() else "",
         updated_at=status_data.get("updated_at", now_iso()),
     )
 
@@ -697,6 +760,178 @@ def scan_inbox(inbox: Path = DEFAULT_INBOX, vault: Path = DEFAULT_VAULT) -> list
         return []
     folders = [path for path in sorted(inbox.iterdir(), key=lambda p: p.name) if path.is_dir()]
     return [scan_folder(folder, vault=vault) for folder in folders]
+
+
+def prepare_folder(folder: Path, vault: Path = DEFAULT_VAULT, extract_auto_images: bool = True) -> PaperRecord:
+    """Prepare deterministic inputs for an external Codex/Claude agent without calling a model API."""
+    record = scan_folder(folder, vault=vault)
+    status_path = folder / "处理状态.json"
+    if not record.pdf:
+        record.status = "needs_retry"
+        record.message = "缺少 正文.pdf 或 PDF 文件"
+        record.updated_at = now_iso()
+        write_json(status_path, asdict(record))
+        return record
+    if not record.doi:
+        record.status = "needs_review"
+        record.message = "未识别 DOI；仍可人工继续，但引用信息需复核"
+
+    doi_safe = record.doi_safe or safe_name(folder.name)
+    input_dir = vault / "AI Inputs"
+    asset_dir = vault / "Assets/Papers" / doi_safe
+    auto_image_dir = asset_dir / "pdf-auto-pages"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    packet_path = input_dir / f"{doi_safe}.paper_text_packet.md"
+    supplements = find_supplements(folder, Path(record.pdf))
+    extract_pdf_packet(Path(record.pdf), packet_path, record.title, record.doi, supplements=supplements)
+
+    manual_images = classify_images(folder)
+    if manual_images:
+        copy_assets(manual_images, asset_dir)
+    auto_manifest: list[dict[str, Any]] = []
+    auto_warning = ""
+    if extract_auto_images and not manual_images:
+        try:
+            auto_manifest = extract_pdf_figure_pages(Path(record.pdf), auto_image_dir)
+        except Exception as exc:
+            auto_warning = f"；自动抽图失败: {type(exc).__name__}: {exc}"
+
+    agent_task_path = input_dir / f"{doi_safe}.agent_task.md"
+    agent_task_path.write_text(
+        "\n".join(
+            [
+                "# Agent Task",
+                "",
+                "请使用当前 Codex/Claude Agent 直接生成中文深读 Markdown，不要调用 DeepSeek API。",
+                "",
+                f"- Text packet: `{packet_path}`",
+                f"- Auto PDF figure pages: `{auto_image_dir}`" if auto_manifest else "- Auto PDF figure pages: 未生成",
+                "- Output must start directly with `# 中文题目`.",
+                "- Do not include YAML/frontmatter/note properties.",
+                "- Do not include preambles such as `好的，遵照您的指示` or `以下是`.",
+                "- If images are available, inspect them directly when your runtime supports image viewing; otherwise rely on captions and text.",
+                "",
+                "After writing the generated Markdown to a temporary file, run:",
+                "",
+                "```bash",
+                f"python scripts/process_paper_inbox.py --inbox <inbox> --vault <vault> --finalize {folder.name} --generated-md <generated-note.md>",
+                "```",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    prepared = scan_folder(folder, vault=vault)
+    prepared.status = "prepared" if record.doi else "needs_review"
+    prepared.message = "已准备文本包" + (
+        f"；自动抽取 PDF 图页 {len(auto_manifest)} 张" if auto_manifest else "；使用手动图片或未抽取图片"
+    ) + auto_warning
+    prepared.packet_path = str(packet_path)
+    prepared.auto_image_dir = str(auto_image_dir) if auto_manifest else ""
+    prepared.supplements = [p.name for p in supplements]
+    prepared.updated_at = now_iso()
+    write_json(status_path, asdict(prepared))
+    return prepared
+
+
+def append_auto_images(markdown_text: str, auto_image_dir: Path, vault: Path) -> str:
+    manifest_path = auto_image_dir / "manifest.json"
+    if not manifest_path.exists():
+        return markdown_text
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return markdown_text
+    if not manifest:
+        return markdown_text
+    text = markdown_text.rstrip() + "\n"
+    if "## PDF 自动抽取图页" not in text:
+        text += "\n## PDF 自动抽取图页\n"
+    for item in manifest:
+        file_path = Path(item.get("file", ""))
+        if not file_path.exists():
+            continue
+        try:
+            rel = os.path.relpath(file_path, vault).replace("\\", "/")
+        except ValueError:
+            rel = str(file_path)
+        if rel in text:
+            continue
+        labels = ", ".join(item.get("labels") or [])
+        caption = f"Page {item.get('page')}" + (f"；检测到：{labels}" if labels else "")
+        text += f"\n### {caption}\n![[{rel}]]\n"
+    return text
+
+
+def finalize_folder(folder: Path, generated_md: Path, vault: Path = DEFAULT_VAULT) -> PaperRecord:
+    """Turn an agent-generated Markdown note into cleaned Markdown plus HTML."""
+    record = scan_folder(folder, vault=vault)
+    status_path = folder / "处理状态.json"
+    if not record.pdf:
+        record.status = "needs_retry"
+        record.message = "无法 finalize：缺少 正文.pdf 或 PDF 文件"
+        write_json(status_path, asdict(record))
+        return record
+
+    doi_safe = record.doi_safe or safe_name(folder.name)
+    note_dir = vault / "Knowledge/Paper Deep Readings"
+    html_dir = vault / "Knowledge/Paper Deep Readings HTML"
+    asset_dir = vault / "Assets/Papers" / doi_safe
+    note_dir.mkdir(parents=True, exist_ok=True)
+    html_dir.mkdir(parents=True, exist_ok=True)
+    asset_dir.mkdir(parents=True, exist_ok=True)
+
+    raw = generated_md.read_text(encoding="utf-8", errors="replace")
+    note_body = clean_model_output(raw)
+    manual_images = classify_images(folder)
+    image_review: list[str] = []
+    if manual_images:
+        copied = copy_assets(manual_images, asset_dir)
+        note_body, image_review = insert_images(note_body, f"Assets/Papers/{doi_safe}", copied)
+    else:
+        auto_dir = asset_dir / "pdf-auto-pages"
+        note_body = append_auto_images(note_body, auto_dir, vault)
+    note_body = clean_model_output(note_body)
+    generated_title = extract_generated_title(note_body, record.title or folder.name)
+
+    existing = read_json(status_path)
+    note_path = unique_note_path(note_dir, generated_title, doi_safe, existing=existing.get("note_path", ""))
+    html_path = unique_html_path(html_dir, generated_title, doi_safe, existing=existing.get("html_path", ""))
+    note_path.write_text(note_body, encoding="utf-8")
+    write_html_output(note_body, html_path, generated_title, vault)
+
+    final_record = scan_folder(folder, vault=vault)
+    final_record.status = "done" if not image_review else "needs_review"
+    final_record.message = "已由当前 Agent 生成 Markdown 和 HTML" + (
+        f"；图片需复核: {'; '.join(image_review)}" if image_review else ""
+    )
+    final_record.note_path = str(note_path)
+    final_record.html_path = str(html_path)
+    final_record.image_review = image_review
+    final_record.packet_path = existing.get("packet_path", final_record.packet_path)
+    final_record.auto_image_dir = existing.get("auto_image_dir", final_record.auto_image_dir)
+    final_record.updated_at = now_iso()
+    write_json(status_path, asdict(final_record))
+    result_path = folder / "处理结果.md"
+    result_path.write_text(
+        "\n".join(
+            [
+                "# 处理结果",
+                "",
+                f"- 状态：{final_record.status}",
+                f"- DOI：{final_record.doi or '未识别'}",
+                f"- 标题：{final_record.title}",
+                f"- Markdown：{note_path}",
+                f"- HTML：{html_path}",
+                f"- 更新时间：{final_record.updated_at}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return final_record
 
 
 def process_folder(folder: Path, vault: Path = DEFAULT_VAULT, force: bool = False, model_route: str = "auto") -> PaperRecord:
@@ -856,6 +1091,10 @@ def main() -> int:
     parser.add_argument("--inbox", type=Path, default=DEFAULT_INBOX)
     parser.add_argument("--vault", type=Path, default=DEFAULT_VAULT)
     parser.add_argument("--scan", action="store_true")
+    parser.add_argument("--prepare", type=Path, default=None, help="Prepare packet and auto-extracted PDF figure pages for agent-side generation")
+    parser.add_argument("--finalize", type=Path, default=None, help="Finalize one folder using --generated-md from the current agent")
+    parser.add_argument("--generated-md", type=Path, default=None, help="Markdown generated by Codex/Claude for --finalize")
+    parser.add_argument("--no-auto-images", action="store_true", help="Do not render PDF figure pages during --prepare")
     parser.add_argument("--process", type=Path, default=None, help="Folder name or path to process")
     parser.add_argument("--process-all", action="store_true")
     parser.add_argument("--refresh-assets", type=Path, default=None, help="Refresh copied image assets for one folder")
@@ -863,9 +1102,25 @@ def main() -> int:
     parser.add_argument("--model", choices=["auto", "deepseek", "claude"], default="auto")
     args = parser.parse_args()
 
-    if args.scan or (not args.process and not args.process_all and not args.refresh_assets):
+    if args.scan or (not args.prepare and not args.finalize and not args.process and not args.process_all and not args.refresh_assets):
         print(json.dumps([asdict(r) for r in scan_inbox(args.inbox, args.vault)], ensure_ascii=False, indent=2))
         return 0
+    if args.prepare:
+        folder = args.prepare
+        if not folder.is_absolute():
+            folder = args.inbox / folder
+        record = prepare_folder(folder, vault=args.vault, extract_auto_images=not args.no_auto_images)
+        print(json.dumps(asdict(record), ensure_ascii=False, indent=2))
+        return 0 if record.status in {"prepared", "needs_review", "done"} else 1
+    if args.finalize:
+        if not args.generated_md:
+            parser.error("--finalize requires --generated-md")
+        folder = args.finalize
+        if not folder.is_absolute():
+            folder = args.inbox / folder
+        record = finalize_folder(folder, args.generated_md, vault=args.vault)
+        print(json.dumps(asdict(record), ensure_ascii=False, indent=2))
+        return 0 if record.status in {"done", "needs_review"} else 1
     if args.process:
         folder = args.process
         if not folder.is_absolute():

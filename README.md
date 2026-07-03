@@ -1,6 +1,6 @@
 # CN Paper Inbox HTML
 
-中文文献投递箱：把论文正文 PDF 和补充材料放进一个文件夹，自动生成中文深读 Markdown 和可分享 HTML。
+中文文献投递箱：把论文正文 PDF 和补充材料放进一个文件夹，让正在使用的 Codex/Claude 直接生成中文深读 Markdown 和可分享 HTML。
 
 适合环境材料、水处理、污染控制等论文精读工作流。输出重点是实验方法、结果解释、机制链条和后续知识库复用。
 
@@ -8,11 +8,12 @@
 
 - 只需要 `正文.pdf` 和补充材料即可处理。
 - 支持补充材料：`.docx`、`.pdf`、`.txt`、`.md`。
-- 可选图片：`图文摘要.jpg`、`图1.jpg`、`图2.jpg` 等。
+- 可选图片：`图文摘要.jpg`、`图1.jpg`、`图2.jpg` 等；未提供图片时自动从 PDF 渲染含 Fig./Figure/图号的页面给 Agent 识别。
 - 生成无 YAML/frontmatter 的 Markdown。
 - 生成同题名 HTML 文件，适合直接分享给学生或同事。
 - 自动剔除模型客套开头，例如“好的，遵照您的指示”。
-- 优先使用 DeepSeek API；未配置时回退 Claude CLI。
+- 默认不需要 DeepSeek API：谁在 Codex/Claude 里使用，就消耗谁当前 Agent 的 token。
+- 仍保留可选的 DeepSeek/Claude CLI 批处理模式。
 - 附带 Codex skill，可复制到 `.codex/skills` 后复用。
 
 ## Folder Format
@@ -59,8 +60,8 @@ pip install -r requirements.txt
 
 Optional:
 
-- Set `DEEPSEEK_API_KEY` to use DeepSeek.
-- Install and log in to Claude CLI if you want Claude fallback.
+- Set `DEEPSEEK_API_KEY` only if you want unattended DeepSeek batch processing.
+- Install and log in to Claude CLI only if you want unattended Claude CLI fallback.
 
 Windows user environment variable example:
 
@@ -69,6 +70,28 @@ Windows user environment variable example:
 ```
 
 ## CLI Usage
+
+Agent-first workflow, recommended for Codex or Claude:
+
+```bash
+python scripts/process_paper_inbox.py --inbox E:\paper --vault E:\MyVault --prepare my-paper-folder
+```
+
+Then ask the current Agent to read:
+
+```text
+<vault>/AI Inputs/<doi-safe>.agent_task.md
+<vault>/AI Inputs/<doi-safe>.paper_text_packet.md
+<vault>/Assets/Papers/<doi-safe>/pdf-auto-pages/
+```
+
+The Agent writes its generated Markdown to a temporary file, then finalizes:
+
+```bash
+python scripts/process_paper_inbox.py --inbox E:\paper --vault E:\MyVault --finalize my-paper-folder --generated-md generated-note.md
+```
+
+Legacy unattended workflow, optional:
 
 ```bash
 python scripts/process_paper_inbox.py --inbox E:\paper --vault E:\MyVault --scan
@@ -82,6 +105,7 @@ Outputs:
 <vault>/Knowledge/Paper Deep Readings/<title>.md
 <vault>/Knowledge/Paper Deep Readings HTML/<title>.html
 <vault>/AI Inputs/<doi-safe>.paper_text_packet.md
+<vault>/AI Inputs/<doi-safe>.agent_task.md
 <vault>/AI Outputs/<doi-safe>.run_log.md
 ```
 
@@ -128,4 +152,4 @@ Then ask Codex to use `cn-paper-inbox-html`.
 
 - This tool does not bypass paywalls or download papers illegally.
 - Do not commit API keys, PDFs, or unpublished data.
-- AI does not visually interpret figures; images are inserted only by file name.
+- In agent-first mode, the current Codex/Claude can inspect auto-rendered PDF figure pages when no manual images are provided.

@@ -1,0 +1,6 @@
+pypdf
+pdfplumber
+python-docx
+PySide6
+Pillow
+Markdown

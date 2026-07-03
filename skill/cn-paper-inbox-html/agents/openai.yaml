@@ -1,0 +1,4 @@
+interface:
+  display_name: "中文文献投递箱 HTML"
+  short_description: "从正文 PDF 和补充材料生成中文深读 Markdown/HTML"
+  default_prompt: "处理 E:\\paper 中按固定命名放置的正文 PDF 和补充材料，生成中文深读 Markdown 与 HTML。"

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.pdf
+*.docx
+*.jpg
+*.jpeg
+*.png
+*.webp
+处理状态.json
+处理结果.md
+AI Inputs/
+AI Outputs/
+Assets/
+Knowledge/

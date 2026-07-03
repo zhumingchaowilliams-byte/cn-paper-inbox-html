@@ -1,0 +1,7 @@
+paper-inbox/
+  10.1016_j.watres.example/
+    正文.pdf
+    补充材料.docx
+    图文摘要.jpg
+    图1.jpg
+    图2.jpg

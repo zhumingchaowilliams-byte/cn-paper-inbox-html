@@ -27,6 +27,14 @@ Optional manually named images are supported but not required:
 
 Also support `supplements\` and `figures\` subfolders. If no manual images are provided, run `--prepare`; the script first uses `pdfplumber` to find PDF image objects and caption-guided figure regions, then uses `pypdfium2` to crop those regions into `<vault>\Assets\Papers\<doi-safe>\pdf-extracted-images\`. If no usable figure region is found, it falls back to rendering PDF pages containing Fig./Figure/图号 labels into `<vault>\Assets\Papers\<doi-safe>\pdf-auto-pages\`.
 
+## Figure Recognition And Insertion
+
+- Treat figure extraction as required for PDF-based deep readings, not as optional decoration.
+- Before writing the final Markdown, inspect the manual images, `pdf-extracted-images`, or fallback `pdf-auto-pages` when the runtime supports image viewing.
+- In `图文导读`, insert each available figure immediately below its `Fig. N` / `图N` heading using Obsidian embed syntax, for example `![[Assets/Papers/<doi-safe>/图1.png]]` or the generated extracted-image path.
+- If the script only produced full-page renders, crop the figure region manually/programmatically when practical; otherwise embed the page render and label it as a fallback figure page.
+- Write the Chinese interpretation under the image. Base visual statements only on the visible image plus the caption/text packet; do not invent visual details.
+
 ## Output Rules
 
 - Write Chinese by default.
@@ -35,6 +43,7 @@ Also support `supplements\` and `figures\` subfolders. If no manual images are p
 - Strip model preambles such as “好的，遵照您的指示”, “以下是”, and any text before the first `#` heading.
 - Do not output code fences around the note.
 - If auto-extracted PDF figure pages exist, inspect them directly when the runtime supports image viewing; otherwise use only PDF text, figure captions, tables, and supplement text.
+- Do not leave `图文导读` text-only when visual assets exist; the note should read as “original figure + Chinese interpretation”.
 - Treat supplementary materials as core evidence for synthesis methods, characterization details, experimental conditions, and controls.
 
 ## Commands

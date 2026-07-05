@@ -9,6 +9,7 @@
 - 只需要 `正文.pdf` 和补充材料即可处理。
 - 支持补充材料：`.docx`、`.pdf`、`.txt`、`.md`。
 - 可选图片：`图文摘要.jpg`、`图1.jpg`、`图2.jpg` 等；未提供图片时先用 `pdfplumber` 找 PDF 图像/figure 区域坐标，再用 `pypdfium2` 裁剪真正的图面，抽不到时才渲染含 Fig./Figure/图号的页面兜底。
+- 深读笔记必须把可用图像嵌入 `图文导读` 对应小节，形成“原图 + 中文识读”；不能只写文字版图文导读。
 - 生成无 YAML/frontmatter 的 Markdown。
 - 生成同题名 HTML 文件，适合直接分享给学生或同事。
 - 自动剔除模型客套开头，例如“好的，遵照您的指示”。
@@ -86,6 +87,8 @@ Then ask the current Agent to read:
 <vault>/Assets/Papers/<doi-safe>/pdf-auto-pages/
 ```
 
+The Agent should inspect available visual assets, crop fallback page renders when practical, insert each figure under the matching `Fig. N` / `图N` heading with Obsidian embed syntax, and write the Chinese figure interpretation below the image.
+
 The Agent writes its generated Markdown to a temporary file, then finalizes:
 
 ```bash
@@ -154,3 +157,4 @@ Then ask Codex to use `cn-paper-inbox-html`.
 - This tool does not bypass paywalls or download papers illegally.
 - Do not commit API keys, PDFs, or unpublished data.
 - In agent-first mode, the current Codex/Claude can inspect auto-cropped PDF figure regions when no manual images are provided. Full-page renders are only a fallback for vector-only or hard-to-extract figures.
+- If visual assets exist, a finished note should not have a text-only `图文导读`.

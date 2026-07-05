@@ -4,4 +4,4 @@ python-docx
 PySide6
 Pillow
 Markdown
-PyMuPDF
+pypdfium2

@@ -148,16 +148,97 @@ def figure_page_candidates(pdf: Path) -> list[tuple[int, list[str]]]:
     return candidates
 
 
-def extract_pdf_figure_pages(pdf: Path, output_dir: Path, max_pages: int = 24) -> list[dict[str, Any]]:
-    """Render pages that appear to contain figures so an agent can inspect them visually."""
-    try:
-        import fitz  # PyMuPDF
-    except Exception as exc:
-        raise RuntimeError("PyMuPDF is required for automatic PDF image extraction. Install with `pip install pymupdf`.") from exc
-
+def clear_image_dir(output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    for old in output_dir.glob("*.png"):
-        old.unlink()
+    for old in output_dir.iterdir():
+        if old.is_file():
+            old.unlink()
+
+
+def clamp_bbox(bbox: tuple[float, float, float, float], width: float, height: float) -> tuple[float, float, float, float]:
+    x0, top, x1, bottom = bbox
+    x0 = max(0.0, min(width, x0))
+    x1 = max(0.0, min(width, x1))
+    top = max(0.0, min(height, top))
+    bottom = max(0.0, min(height, bottom))
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if bottom < top:
+        top, bottom = bottom, top
+    return x0, top, x1, bottom
+
+
+def expand_bbox(
+    bbox: tuple[float, float, float, float],
+    width: float,
+    height: float,
+    margin: float = 10.0,
+) -> tuple[float, float, float, float]:
+    x0, top, x1, bottom = bbox
+    return clamp_bbox((x0 - margin, top - margin, x1 + margin, bottom + margin), width, height)
+
+
+def bbox_area(bbox: tuple[float, float, float, float]) -> float:
+    x0, top, x1, bottom = bbox
+    return max(0.0, x1 - x0) * max(0.0, bottom - top)
+
+
+def bbox_iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax0, at, ax1, ab = a
+    bx0, bt, bx1, bb = b
+    ix0, it = max(ax0, bx0), max(at, bt)
+    ix1, ib = min(ax1, bx1), min(ab, bb)
+    inter = bbox_area((ix0, it, ix1, ib))
+    if inter <= 0:
+        return 0.0
+    return inter / max(bbox_area(a) + bbox_area(b) - inter, 1.0)
+
+
+def dedupe_bboxes(candidates: list[dict[str, Any]], iou_threshold: float = 0.72) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    for candidate in sorted(candidates, key=lambda item: bbox_area(item["bbox"]), reverse=True):
+        bbox = candidate["bbox"]
+        if any(bbox_iou(bbox, item["bbox"]) >= iou_threshold for item in kept):
+            continue
+        kept.append(candidate)
+    return sorted(kept, key=lambda item: (item["page"], item["bbox"][1], item["bbox"][0]))
+
+
+def render_pdf_bbox(
+    pdfium_doc: Any,
+    page_index: int,
+    bbox: tuple[float, float, float, float],
+    dest: Path,
+    scale: float = 2.5,
+) -> tuple[int, int]:
+    page = pdfium_doc[page_index]
+    try:
+        bitmap = page.render(scale=scale)
+        image = bitmap.to_pil()
+        x0, top, x1, bottom = bbox
+        crop_box = (
+            int(round(x0 * scale)),
+            int(round(top * scale)),
+            int(round(x1 * scale)),
+            int(round(bottom * scale)),
+        )
+        cropped = image.crop(crop_box)
+        cropped.save(dest)
+        return cropped.width, cropped.height
+    finally:
+        close = getattr(page, "close", None)
+        if callable(close):
+            close()
+
+
+def extract_pdf_figure_pages(pdf: Path, output_dir: Path, max_pages: int = 24) -> list[dict[str, Any]]:
+    """Render pages that appear to contain figures as a last-resort fallback."""
+    try:
+        import pypdfium2 as pdfium
+    except Exception as exc:
+        raise RuntimeError("pypdfium2 is required for PDF rendering. Install with `pip install pypdfium2`.") from exc
+
+    clear_image_dir(output_dir)
 
     candidates = figure_page_candidates(pdf)
     if not candidates:
@@ -165,26 +246,220 @@ def extract_pdf_figure_pages(pdf: Path, output_dir: Path, max_pages: int = 24) -
     candidates = candidates[:max_pages]
 
     manifest: list[dict[str, Any]] = []
-    doc = fitz.open(str(pdf))
+    doc = pdfium.PdfDocument(str(pdf))
     try:
-        zoom = 2.0
-        matrix = fitz.Matrix(zoom, zoom)
         for page_number, labels in candidates:
-            page = doc[page_number - 1]
-            pix = page.get_pixmap(matrix=matrix, alpha=False)
             name = f"pdf-page-{page_number:03d}.png"
             dest = output_dir / name
-            pix.save(str(dest))
+            page = doc[page_number - 1]
+            try:
+                width, height = page.get_size()
+            finally:
+                close = getattr(page, "close", None)
+                if callable(close):
+                    close()
+            out_width, out_height = render_pdf_bbox(doc, page_number - 1, (0.0, 0.0, width, height), dest, scale=2.0)
             manifest.append(
                 {
                     "page": page_number,
                     "file": str(dest),
+                    "width": out_width,
+                    "height": out_height,
                     "labels": labels,
+                    "source": "full-page-fallback",
                     "note": "PDF page rendered automatically for agent-side visual inspection.",
                 }
             )
     finally:
         doc.close()
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest
+
+
+def caption_lines(words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pattern = re.compile(r"^(?:Fig\.?|Figure|图)\s*\d+[A-Za-z]?[.:：]?$", re.I)
+    lines: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for word in words:
+        key = (int(round(float(word.get("top", 0)) / 4)), int(round(float(word.get("bottom", 0)) / 4)))
+        lines.setdefault(key, []).append(word)
+    captions: list[dict[str, Any]] = []
+    for grouped in lines.values():
+        grouped = sorted(grouped, key=lambda w: float(w.get("x0", 0)))
+        text = " ".join(str(w.get("text", "")) for w in grouped)
+        if not re.search(r"\b(?:Fig\.?|Figure)\s*\d+|图\s*\d+", text, flags=re.I):
+            continue
+        if not any(pattern.match(str(w.get("text", ""))) for w in grouped) and not re.search(r"图\s*\d+", text):
+            continue
+        captions.append(
+            {
+                "text": text,
+                "x0": min(float(w["x0"]) for w in grouped),
+                "x1": max(float(w["x1"]) for w in grouped),
+                "top": min(float(w["top"]) for w in grouped),
+                "bottom": max(float(w["bottom"]) for w in grouped),
+            }
+        )
+    return sorted(captions, key=lambda item: (item["top"], item["x0"]))
+
+
+def object_bbox(obj: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    try:
+        return float(obj["x0"]), float(obj["top"]), float(obj["x1"]), float(obj["bottom"])
+    except Exception:
+        return None
+
+
+def visual_object_candidates(page: Any, min_area: float) -> list[tuple[float, float, float, float]]:
+    boxes: list[tuple[float, float, float, float]] = []
+    for collection in [page.images, page.rects, page.curves, page.lines]:
+        for obj in collection:
+            bbox = object_bbox(obj)
+            if not bbox:
+                continue
+            if bbox_area(bbox) >= min_area:
+                boxes.append(bbox)
+    return boxes
+
+
+def union_bboxes(boxes: list[tuple[float, float, float, float]]) -> tuple[float, float, float, float]:
+    return (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
+
+
+def caption_guided_bbox(
+    caption: dict[str, Any],
+    visual_boxes: list[tuple[float, float, float, float]],
+    page_width: float,
+    page_height: float,
+) -> tuple[float, float, float, float] | None:
+    caption_top = float(caption["top"])
+    caption_x0 = float(caption["x0"])
+    caption_x1 = float(caption["x1"])
+    caption_width = caption_x1 - caption_x0
+    full_width_caption = caption_width > page_width * 0.42
+    if full_width_caption:
+        x0, x1 = 0.0, page_width
+    else:
+        center = (caption_x0 + caption_x1) / 2
+        if center < page_width / 2:
+            x0, x1 = 0.0, page_width / 2 + 18
+        else:
+            x0, x1 = page_width / 2 - 18, page_width
+    window_top = max(0.0, caption_top - page_height * 0.62)
+    nearby = [
+        box
+        for box in visual_boxes
+        if box[3] <= caption_top + 8
+        and box[1] >= window_top
+        and not (box[2] < x0 or box[0] > x1)
+    ]
+    if nearby:
+        return expand_bbox(union_bboxes(nearby), page_width, page_height, margin=12)
+
+    crop_top = max(0.0, caption_top - page_height * 0.48)
+    crop_bottom = max(crop_top + 80, caption_top - 4)
+    bbox = clamp_bbox((x0, crop_top, x1, crop_bottom), page_width, page_height)
+    return bbox if bbox_area(bbox) >= 45000 else None
+
+
+def extract_pdf_figure_regions(
+    pdf: Path,
+    output_dir: Path,
+    min_width: int = 160,
+    min_height: int = 120,
+    min_area: int = 45000,
+    max_regions: int = 80,
+) -> list[dict[str, Any]]:
+    """Crop likely figure regions using pdfplumber coordinates and pypdfium2 rendering."""
+    try:
+        import pdfplumber
+        import pypdfium2 as pdfium
+    except Exception as exc:
+        raise RuntimeError("pdfplumber and pypdfium2 are required for figure-region extraction.") from exc
+
+    clear_image_dir(output_dir)
+
+    manifest: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    with pdfplumber.open(str(pdf)) as plumber_doc:
+        for page_index, page in enumerate(plumber_doc.pages):
+            page_width, page_height = float(page.width), float(page.height)
+            visual_boxes = visual_object_candidates(page, min_area=2500)
+            for image_index, bbox in enumerate(page.images, start=1):
+                obj_bbox = object_bbox(bbox)
+                if not obj_bbox:
+                    continue
+                if bbox_area(obj_bbox) < min_area:
+                    continue
+                candidates.append(
+                    {
+                        "page": page_index + 1,
+                        "bbox": expand_bbox(obj_bbox, page_width, page_height, margin=8),
+                        "source": "pdfplumber-image-object",
+                        "label": f"image-object-{image_index}",
+                    }
+                )
+            try:
+                words = page.extract_words(x_tolerance=1, y_tolerance=3) or []
+            except Exception:
+                words = []
+            for caption_index, caption in enumerate(caption_lines(words), start=1):
+                bbox = caption_guided_bbox(caption, visual_boxes, page_width, page_height)
+                if bbox and bbox_area(bbox) >= min_area:
+                    candidates.append(
+                        {
+                            "page": page_index + 1,
+                            "bbox": bbox,
+                            "source": "caption-guided-region",
+                            "label": caption["text"][:120],
+                            "caption": caption["text"],
+                        }
+                    )
+
+    candidates = dedupe_bboxes(candidates)[:max_regions]
+    pdfium_doc = pdfium.PdfDocument(str(pdf))
+    try:
+        for index, item in enumerate(candidates, start=1):
+            page = int(item["page"])
+            bbox = item["bbox"]
+            name = f"pdf-figure-p{page:03d}-{index:02d}.png"
+            dest = output_dir / name
+            width, height = render_pdf_bbox(pdfium_doc, page - 1, bbox, dest, scale=2.8)
+            if width < min_width or height < min_height:
+                dest.unlink(missing_ok=True)
+                continue
+            digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+            if any(entry.get("sha256") == digest for entry in manifest):
+                dest.unlink(missing_ok=True)
+                continue
+            x0, top, x1, bottom = bbox
+            manifest.append(
+                {
+                    "page": page,
+                    "file": str(dest),
+                    "width": width,
+                    "height": height,
+                    "bbox": {
+                        "x0": round(x0, 2),
+                        "top": round(top, 2),
+                        "x1": round(x1, 2),
+                        "bottom": round(bottom, 2),
+                    },
+                    "source": item["source"],
+                    "label": item.get("label", ""),
+                    "caption": item.get("caption", ""),
+                    "sha256": digest,
+                    "note": "Figure region cropped from PDF coordinates via pdfplumber + pypdfium2, not a full-page screenshot.",
+                }
+            )
+    finally:
+        close = getattr(pdfium_doc, "close", None)
+        if callable(close):
+            close()
     (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
 
@@ -197,80 +472,15 @@ def extract_pdf_embedded_images(
     min_area: int = 45000,
     max_images: int = 80,
 ) -> list[dict[str, Any]]:
-    """Extract real embedded raster images from the PDF before falling back to page screenshots.
-
-    Many publisher PDFs store figures as image XObjects. This function pulls those original
-    image objects instead of rendering the whole page. Vector-only figures still require a
-    fallback page render.
-    """
-    try:
-        import fitz  # PyMuPDF
-    except Exception as exc:
-        raise RuntimeError("PyMuPDF is required for PDF image extraction. Install with `pip install pymupdf`.") from exc
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for old in output_dir.iterdir():
-        if old.is_file():
-            old.unlink()
-
-    manifest: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    doc = fitz.open(str(pdf))
-    try:
-        for page_index in range(len(doc)):
-            page = doc[page_index]
-            for image_index, image_info in enumerate(page.get_images(full=True), start=1):
-                xref = image_info[0]
-                try:
-                    extracted = doc.extract_image(xref)
-                except Exception:
-                    continue
-                width = int(extracted.get("width") or 0)
-                height = int(extracted.get("height") or 0)
-                image_bytes = extracted.get("image") or b""
-                ext = (extracted.get("ext") or "png").lower()
-                if width < min_width or height < min_height or width * height < min_area:
-                    continue
-                digest = hashlib.sha256(image_bytes).hexdigest()
-                if digest in seen:
-                    continue
-                seen.add(digest)
-                rects = []
-                try:
-                    rects = [
-                        {
-                            "x0": round(rect.x0, 2),
-                            "y0": round(rect.y0, 2),
-                            "x1": round(rect.x1, 2),
-                            "y1": round(rect.y1, 2),
-                        }
-                        for rect in page.get_image_rects(xref)
-                    ]
-                except Exception:
-                    rects = []
-                name = f"pdf-image-p{page_index + 1:03d}-{image_index:02d}.{ext}"
-                dest = output_dir / name
-                dest.write_bytes(image_bytes)
-                manifest.append(
-                    {
-                        "page": page_index + 1,
-                        "file": str(dest),
-                        "width": width,
-                        "height": height,
-                        "xref": xref,
-                        "rects": rects,
-                        "source": "embedded-image",
-                        "note": "Real embedded PDF image object extracted directly, not a full-page screenshot.",
-                    }
-                )
-                if len(manifest) >= max_images:
-                    break
-            if len(manifest) >= max_images:
-                break
-    finally:
-        doc.close()
-    (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    return manifest
+    """Compatibility wrapper: crop figure-like regions before falling back to full-page renders."""
+    return extract_pdf_figure_regions(
+        pdf=pdf,
+        output_dir=output_dir,
+        min_width=min_width,
+        min_height=min_height,
+        min_area=min_area,
+        max_regions=max_images,
+    )
 
 
 def extract_pdf_metadata(pdf: Path) -> tuple[int, str, str, str]:

@@ -977,6 +977,16 @@ def html_document(title: str, body: str) -> str:
       color: #23384a;
     }}
     p, li {{ font-size: 16px; }}
+    p > strong:only-child {{
+      display: block;
+      padding: 14px 18px 14px 22px;
+      margin: 4px 0;
+      background: #eef4f2;
+      border-left: 5px solid var(--accent);
+      color: #0f3f39;
+      font-size: 16.5px;
+      line-height: 1.8;
+    }}
     ul, ol {{ padding-left: 1.4em; }}
     blockquote {{
       margin: 18px 0;
@@ -1242,6 +1252,30 @@ def prepare_folder(folder: Path, vault: Path = DEFAULT_VAULT, extract_auto_image
                 "- Insert each available figure under its matching `Fig. N` / `图N` heading with Obsidian embeds such as `![[Assets/Papers/<doi-safe>/图1.png]]`, then write the Chinese interpretation below it.",
                 "- If only full-page renders are available, crop the figure region when practical; otherwise embed the page render and label it as a fallback figure page.",
                 "",
+                "Use exactly this section order, with no additions or reordering:",
+                "",
+                "```text",
+                "# 中文题目",
+                "## 文章简介",
+                "## 成果介绍",
+                "## 全文速览",
+                "## 图文导读",
+                "## 机制链条",
+                "## 方法细读",
+                "## 分析与思考",
+                "## 文章信息",
+                "## 人工核查清单",
+                "```",
+                "",
+                "- 文章简介 merges the one-sentence conclusion and keywords into one flowing paragraph.",
+                "- 成果介绍 uses two to four paragraphs, first paragraph in bold.",
+                "- 全文速览 lists section-by-section progress only, no repeated numbers.",
+                "- 图文导读 gives each figure its own `### 图 N` heading, the embedded figure, the Chinese reading, then a three-column key-experiment table for that figure only.",
+                "- 机制链条 and 方法细读 follow, with 方法细读 allowed to be the most detailed section.",
+                "- 分析与思考 replaces any literature-review framing; write implications, transferable methods, gaps and limits only.",
+                "- 文章信息 goes near the end and omits submission and acceptance dates.",
+                "- Do not add an image-asset listing section; figures belong in 图文导读.",
+                "",
                 "After writing the generated Markdown to a temporary file, run:",
                 "",
                 "```bash",
@@ -1266,42 +1300,39 @@ def prepare_folder(folder: Path, vault: Path = DEFAULT_VAULT, extract_auto_image
     return prepared
 
 
-def append_auto_images(markdown_text: str, auto_image_dir: Path, vault: Path) -> str:
-    manifest_path = auto_image_dir / "manifest.json"
-    if not manifest_path.exists():
-        return markdown_text
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception:
-        return markdown_text
-    if not manifest:
-        return markdown_text
-    text = markdown_text.rstrip() + "\n"
-    section_title = "## PDF 自动抽取图片"
-    if "pdf-auto-pages" in str(auto_image_dir):
-        section_title = "## PDF 自动抽取图页"
-    if section_title not in text:
-        text += f"\n{section_title}\n"
-    for item in manifest:
-        file_path = Path(item.get("file", ""))
-        if not file_path.exists():
+def warn_unreferenced_assets(markdown_text: str, asset_dirs: list[Path], vault: Path) -> None:
+    """Warn when extracted figures are never embedded in the note.
+
+    Figures must appear inside 图文导读 under their own heading. Appending a
+    catch-all asset section at the end of the note is no longer done, so the
+    only signal that something was missed is this warning.
+    """
+    for asset_dir in asset_dirs:
+        manifest_path = asset_dir / "manifest.json"
+        if not manifest_path.exists():
             continue
         try:
-            rel = os.path.relpath(file_path, vault).replace("\\", "/")
-        except ValueError:
-            rel = str(file_path)
-        if rel in text:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
             continue
-        labels = ", ".join(item.get("labels") or [])
-        source = item.get("source", "")
-        if source == "embedded-image":
-            caption = f"Page {item.get('page')} extracted image"
-            if item.get("width") and item.get("height"):
-                caption += f"；{item.get('width')} x {item.get('height')}"
-        else:
-            caption = f"Page {item.get('page')}" + (f"；检测到：{labels}" if labels else "")
-        text += f"\n### {caption}\n![[{rel}]]\n"
-    return text
+        missing: list[str] = []
+        for item in manifest:
+            file_path = Path(item.get("file", ""))
+            if not file_path.exists():
+                continue
+            try:
+                rel = os.path.relpath(file_path, vault).replace("\\", "/")
+            except ValueError:
+                rel = str(file_path)
+            if rel not in markdown_text:
+                missing.append(file_path.name)
+        if missing:
+            print(
+                f"警告：{len(missing)} 张已抽取的图未被笔记引用（{asset_dir.name}）："
+                + "、".join(missing[:8])
+                + ("…" if len(missing) > 8 else ""),
+                file=sys.stderr,
+            )
 
 
 def finalize_folder(folder: Path, generated_md: Path, vault: Path = DEFAULT_VAULT) -> PaperRecord:
@@ -1332,8 +1363,7 @@ def finalize_folder(folder: Path, generated_md: Path, vault: Path = DEFAULT_VAUL
     else:
         extracted_dir = asset_dir / "pdf-extracted-images"
         page_dir = asset_dir / "pdf-auto-pages"
-        note_body = append_auto_images(note_body, extracted_dir, vault)
-        note_body = append_auto_images(note_body, page_dir, vault)
+        warn_unreferenced_assets(note_body, [extracted_dir, page_dir], vault)
     note_body = clean_model_output(note_body)
     generated_title = extract_generated_title(note_body, record.title or folder.name)
 

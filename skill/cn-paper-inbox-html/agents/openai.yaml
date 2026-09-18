@@ -1,4 +1,4 @@
 interface:
   display_name: "中文文献投递箱 HTML"
-  short_description: "从正文 PDF 和补充材料生成中文深读 Markdown/HTML"
-  default_prompt: "处理 E:\\paper 中按固定命名放置的正文 PDF 和补充材料，生成中文深读 Markdown 与 HTML。"
+  short_description: "把正文 PDF 与补充材料转成中文深读 Markdown 与可分享 HTML"
+  default_prompt: "处理 inbox 中按固定命名放置的正文 PDF 和补充材料，抽取 PDF 图区，生成排版规范的中文深读 Markdown 与 HTML。"

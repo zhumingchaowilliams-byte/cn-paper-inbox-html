@@ -1,15 +1,18 @@
 ---
 name: cn-paper-inbox-html
-description: Portable Chinese paper inbox workflow for environmental materials, water treatment, and pollution-control papers. Use when Codex needs to process folders containing only a main paper PDF and supplementary materials, auto-crop PDF figure regions with pdfplumber coordinates and pypdfium2 when images are missing, generate Chinese deep-reading notes with the current agent's own token budget, export polished HTML, avoid YAML/frontmatter note properties, or package the workflow for students and collaborators.
+description: 中文文献投递箱，把论文正文 PDF 与补充材料批量转成结构化的中文深读 Markdown 与可分享 HTML，面向环境材料、水处理与污染控制方向。当需要处理只含正文 PDF 和补充材料的文献文件夹、在图缺失时用 pdfplumber 坐标配合 pypdfium2 自动裁剪 PDF 图区、用当前 Agent 自身 token 生成中文深读笔记、导出排版规范的 HTML、输出不含 YAML frontmatter 的笔记，或把这套流程打包给研究生与协作者使用时调用。触发词：文献投递箱、论文深读、中文精读笔记、PDF 转 HTML、图文导读、批量处理文献、paper inbox。
+agent_created: true
 ---
 
 # 中文文献投递箱 HTML
 
-## Core Workflow
+把一个文献文件夹转成中文深读笔记与可分享 HTML。正文 PDF 加补充材料即可，无需预先准备图片，也无需要求任何外部模型 API Key。
 
-Use `scripts/process_paper_inbox.py` for deterministic file preparation and finalization. The current Codex/Claude agent should generate the Chinese note itself; do not require a DeepSeek API key for normal interactive use.
+## 核心理念
 
-The minimum input is:
+当前 Agent 自己读文本包、自己写中文笔记，消耗的是本次会话的 token。脚本只负责确定性的文件准备与收尾，不承担写作，也不调用外部推理服务。
+
+## 最小输入
 
 ```text
 <inbox>\<paper-folder>\
@@ -17,7 +20,7 @@ The minimum input is:
   补充材料.docx / supplementary.pdf / .txt / .md
 ```
 
-Optional manually named images are supported but not required:
+可选手工命名图片：
 
 ```text
   图文摘要.jpg
@@ -25,66 +28,56 @@ Optional manually named images are supported but not required:
   图2.jpg
 ```
 
-Also support `supplements\` and `figures\` subfolders. If no manual images are provided, run `--prepare`; the script first uses `pdfplumber` to find PDF image objects and caption-guided figure regions, then uses `pypdfium2` to crop those regions into `<vault>\Assets\Papers\<doi-safe>\pdf-extracted-images\`. If no usable figure region is found, it falls back to rendering PDF pages containing Fig./Figure/图号 labels into `<vault>\Assets\Papers\<doi-safe>\pdf-auto-pages\`.
+也支持 `supplements\` 与 `figures\` 子目录。未提供图片时，脚本先用 `pdfplumber` 定位 PDF 图像对象与题注引导的图区，再用 `pypdfium2` 裁剪到 `<vault>\Assets\Papers\<doi-safe>\pdf-extracted-images\`。若未识别到可用图区，则回退为渲染含 Fig./Figure/图号的页面到 `pdf-auto-pages\`。
 
-## Figure Recognition And Insertion
-
-- Treat figure extraction as required for PDF-based deep readings, not as optional decoration.
-- Before writing the final Markdown, inspect the manual images, `pdf-extracted-images`, or fallback `pdf-auto-pages` when the runtime supports image viewing.
-- In `图文导读`, insert each available figure immediately below its `Fig. N` / `图N` heading using Obsidian embed syntax, for example `![[Assets/Papers/<doi-safe>/图1.png]]` or the generated extracted-image path.
-- If the script only produced full-page renders, crop the figure region manually/programmatically when practical; otherwise embed the page render and label it as a fallback figure page.
-- Write the Chinese interpretation under the image. Base visual statements only on the visible image plus the caption/text packet; do not invent visual details.
-
-## Output Rules
-
-- Write Chinese by default.
-- Generate Markdown without YAML/frontmatter/note properties.
-- Generate a same-title HTML file with readable CSS.
-- Strip model preambles such as “好的，遵照您的指示”, “以下是”, and any text before the first `#` heading.
-- Do not output code fences around the note.
-- If auto-extracted PDF figure pages exist, inspect them directly when the runtime supports image viewing; otherwise use only PDF text, figure captions, tables, and supplement text.
-- Do not leave `图文导读` text-only when visual assets exist; the note should read as “original figure + Chinese interpretation”.
-- Treat supplementary materials as core evidence for synthesis methods, characterization details, experimental conditions, and controls.
-
-## Commands
-
-Recommended agent-first flow:
+## 工作流程
 
 ```bash
 python scripts/process_paper_inbox.py --inbox <inbox> --vault <vault> --prepare <folder-name>
 ```
 
-Then read `<vault>\AI Inputs\<doi-safe>.agent_task.md`, the generated text packet, and, if present, inspect extracted PDF images or fallback rendered PDF figure pages. Write the Chinese note yourself as Markdown, starting directly with `# 标题`. Save it to a temporary `.md` file, then finalize:
+随后读取 `<vault>\AI Inputs\<doi-safe>.agent_task.md` 与生成的文本包，若存在则查看抽取出的图或回退渲染的图页。由当前 Agent 自己写中文笔记为 Markdown，直接以 `# 标题` 开头，存成临时 `.md`，再收尾：
 
 ```bash
 python scripts/process_paper_inbox.py --inbox <inbox> --vault <vault> --finalize <folder-name> --generated-md <generated-note.md>
 ```
 
-Utility commands:
+`--generated-md` 在 Windows 下必须传原生路径（`C:\...`），不能用 Git Bash 的 `/c/...` 形式，否则会被当作字面量。
+
+辅助命令：
 
 ```bash
 python scripts/process_paper_inbox.py --inbox <inbox> --vault <vault> --scan
-python scripts/process_paper_inbox.py --inbox <inbox> --vault <vault> --process-all
 python scripts/process_paper_inbox.py --inbox <inbox> --vault <vault> --refresh-assets <folder-name>
 ```
 
-## Model Routing
+## 图表规范
 
-- Normal interactive use: do not call DeepSeek or Claude CLI; the current Codex/Claude agent reads the prepared packet and generates the Markdown.
-- Optional unattended batch mode: `--process` and `--process-all` can use `DEEPSEEK_API_KEY` or Claude CLI, but this is not required for skill use.
+图不是装饰，是深读的必备内容。PDF 类文献必须完成图区抽取与嵌入。
 
-## Default Local Paths
+- 写最终 Markdown 前，先查看手工图片、`pdf-extracted-images` 或回退的 `pdf-auto-pages`。
+- 在 `图文导读` 中，把每张可用图紧接在其 `Fig. N` / `图N` 标题下方，用 Obsidian 嵌入语法，例如 `![[Assets/Papers/<doi-safe>/图1.png]]`。
+- 图片解读写在图片下方，只能依据可见图像加题注与正文，不臆造画面细节。
+- 若脚本只产出整页渲染，尽量裁出图区；实在无法裁剪时嵌入整页并标注为回退图页。
+- 有视觉素材时，`图文导读` 不得只写文字。
 
-The bundled script defaults to portable local folders:
+## 排版规范
 
-```text
-inbox: <current directory>\paper
-vault: <current directory>\vault
-```
+脚本会把 Markdown 渲染为 HTML。表格、粗体、斜体、行内代码、代码块、引用、列表都会被正确解析，表格带斑马纹与深色表头，窄屏可横向滚动，宽表格不会被压扁。
 
-For real work, prefer passing `--inbox` and `--vault` explicitly.
+写笔记时遵守以下约定，避免格式塌陷。
 
-## Expected Outputs
+- 表格必须写标准的 Markdown 表头分隔行，即首行表头、第二行 `|---|---|`，否则不会被识别为表格。分隔行列数要与表头一致。
+- 表格单元格内不要换行，长内容用短句分段表达，或拆成多行表格。
+- 单元格内避免出现裸的竖线字符，需要时用顿号或分号替代。
+- 表格列数以 2 至 4 列为宜，超过 5 列在窄屏上可读性会明显下降。
+- 段落中不要用竖线做分隔符，改用标点或换行。
+- 强调用 `**粗体**`，术语首次出现可用 `*斜体*`，但不要整段加粗。
+- 输出不含 YAML frontmatter 与笔记属性。
+- 不要在笔记前后添加“好的，遵照您的指示”“以下是”之类的客套开头，也不要给笔记套代码围栏。
+- 把补充材料当作方法学、表征细节、实验条件与对照组的核心证据。
+
+## 输出物
 
 ```text
 <vault>\Knowledge\Paper Deep Readings\<title>.md
@@ -96,4 +89,27 @@ For real work, prefer passing `--inbox` and `--vault` explicitly.
 <paper-folder>\处理结果.md
 ```
 
-If DOI extraction fails, mark the folder `needs_review` and do not pretend the citation is complete.
+若 DOI 抽取失败，文件夹标记为 `needs_review`，不得假装引用信息完整。
+
+## 默认路径
+
+```text
+inbox: <current directory>\paper
+vault: <current directory>\vault
+```
+
+实际使用时建议显式传入 `--inbox` 与 `--vault`。
+
+## 依赖
+
+```bash
+pip install -r requirements.txt
+```
+
+含 pypdf、pdfplumber、python-docx、Pillow、Markdown、pypdfium2。PySide6 仅桌面版界面需要，命令行流程不必安装。
+
+若 HTML 中表格被压成一行纯文本，说明 `Markdown` 包不完整，执行 `pip install --force-reinstall Markdown` 修复。脚本检测到库异常时会向 stderr 输出警告，并自动切换到内置渲染器。
+
+## 边界
+
+不绕过付费墙，不下载文献。不要把 API Key、PDF 或未发表数据提交到仓库。

@@ -14,7 +14,6 @@ import subprocess
 import sys
 import time
 import traceback
-import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -592,30 +591,6 @@ def prompt_text(vault: Path) -> str:
     return """你是一名环境材料与水处理方向的中文论文精读助手。请输出中文深读笔记，包含：题目、关键词、一句话结论、文章信息、成果简介、全文速览、图文导读、方法细读、关键实验卡片、机制链条、我以后可以怎么用、人工核查清单。所有关键结论必须绑定图号或表号；没有说明的实验条件写“文本未说明”。如果文本包包含 Supplementary Materials，必须优先从补充材料中补充材料合成方法、表征细节、补充图表、实验条件和对照组。""" + output_rules
 
 
-def call_deepseek(prompt: str, source_text: str, model: str = "deepseek-v4-flash") -> str:
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    if not api_key:
-        raise RuntimeError("DEEPSEEK_API_KEY is not configured")
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": "以下是论文文本包，请按要求输出中文深读笔记：\n\n" + source_text},
-        ],
-        "stream": False,
-    }
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.deepseek.com/chat/completions",
-        data=data,
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=1200) as response:
-        result = json.loads(response.read().decode("utf-8"))
-    return result["choices"][0]["message"]["content"]
-
-
 def call_claude(prompt: str, source_text: str, budget: str = "1") -> str:
     if not CLAUDE.exists():
         raise RuntimeError(f"Claude CLI not found: {CLAUDE}")
@@ -641,7 +616,7 @@ def call_claude(prompt: str, source_text: str, budget: str = "1") -> str:
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Claude CLI 超时：超过 {timeout_seconds} 秒仍未返回。可点“重新处理”重试，或设置 DEEPSEEK_API_KEY 后走 DeepSeek。") from exc
+        raise RuntimeError(f"Claude CLI 超时：超过 {timeout_seconds} 秒仍未返回。可点“重新处理”重试，或改用 --prepare 由当前 Agent 直接生成。") from exc
     if proc.returncode != 0:
         details = (proc.stderr or proc.stdout or "").strip()
         if len(details) > 4000:
@@ -653,10 +628,6 @@ def call_claude(prompt: str, source_text: str, budget: str = "1") -> str:
 def generate_deep_reading(vault: Path, packet: Path, model_route: str = "auto") -> tuple[str, str]:
     prompt = prompt_text(vault)
     source_text = packet.read_text(encoding="utf-8", errors="replace")
-    if model_route in {"auto", "deepseek"} and os.environ.get("DEEPSEEK_API_KEY"):
-        return call_deepseek(prompt, source_text), "deepseek"
-    if model_route == "deepseek":
-        raise RuntimeError("DEEPSEEK_API_KEY is not configured")
     return call_claude(prompt, source_text), "claude"
 
 
@@ -782,25 +753,93 @@ def markdown_to_html(markdown_text: str, title: str, html_path: Path, vault: Pat
         return f'<figure><img src="{html.escape(src)}" alt="{html.escape(alt)}"><figcaption>{html.escape(alt)}</figcaption></figure>'
 
     converted = re.sub(r"!\[\[([^\]]+)\]\]", convert_obsidian_image, markdown_text)
+    body = None
     try:
         import markdown  # type: ignore
 
-        body = markdown.markdown(converted, extensions=["tables", "fenced_code", "toc"])
-    except Exception:
+        renderer = getattr(markdown, "markdown", None)
+        if callable(renderer):
+            body = renderer(converted, extensions=["tables", "fenced_code", "toc"])
+        else:
+            print("警告：markdown 库不完整，已回退到内置渲染器。建议执行 pip install --force-reinstall Markdown。", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001
+        print(f"警告：markdown 渲染失败（{exc}），已回退到内置渲染器。", file=sys.stderr)
+    if body is None:
         body = fallback_markdown_to_html(converted)
+    body = wrap_tables(body)
     return html_document(title, body)
+
+
+def wrap_tables(body: str) -> str:
+    """Wrap every table in a scroll container so wide tables stay readable on narrow screens."""
+    return re.sub(
+        r"(<table>.*?</table>)",
+        lambda m: '<div class="table-wrap">' + m.group(1) + "</div>",
+        body,
+        flags=re.DOTALL,
+    )
+
+
+def inline_markup(text: str) -> str:
+    """Render inline Markdown (bold, italic, code, links) on already-escaped text."""
+    escaped = html.escape(text)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", escaped)
+    escaped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', escaped)
+    return escaped
+
+
+def split_table_row(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def is_table_separator(line: str) -> bool:
+    cells = split_table_row(line)
+    if not cells:
+        return False
+    return all(re.fullmatch(r":?-{2,}:?", cell) for cell in cells)
+
+
+def render_table(rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    has_header = len(rows) > 1
+    out = ["<table>"]
+    if has_header:
+        out.append("<thead>")
+        out.append("<tr>" + "".join(f"<th>{inline_markup(c)}</th>" for c in rows[0]) + "</tr>")
+        out.append("</thead>")
+        body_rows = rows[1:]
+    else:
+        body_rows = rows
+    if body_rows:
+        out.append("<tbody>")
+        for row in body_rows:
+            out.append("<tr>" + "".join(f"<td>{inline_markup(c)}</td>" for c in row) + "</tr>")
+        out.append("</tbody>")
+    out.append("</table>")
+    return "\n".join(out)
 
 
 def fallback_markdown_to_html(markdown_text: str) -> str:
     lines = markdown_text.splitlines()
     parts: list[str] = []
     in_list = False
+    in_code = False
+    code_buffer: list[str] = []
     paragraph: list[str] = []
+    table_buffer: list[str] = []
 
     def flush_paragraph() -> None:
         nonlocal paragraph
         if paragraph:
-            parts.append("<p>" + html.escape(" ".join(paragraph)) + "</p>")
+            parts.append("<p>" + inline_markup(" ".join(paragraph)) + "</p>")
             paragraph = []
 
     def close_list() -> None:
@@ -809,35 +848,80 @@ def fallback_markdown_to_html(markdown_text: str) -> str:
             parts.append("</ul>")
             in_list = False
 
+    def flush_table() -> None:
+        nonlocal table_buffer
+        if table_buffer:
+            rows: list[list[str]] = []
+            for raw in table_buffer:
+                if is_table_separator(raw):
+                    continue
+                rows.append(split_table_row(raw))
+            rendered = render_table(rows)
+            if rendered:
+                parts.append(rendered)
+            table_buffer = []
+
     for line in lines:
         stripped = line.strip()
+        if stripped.startswith("```"):
+            flush_paragraph()
+            close_list()
+            flush_table()
+            if in_code:
+                parts.append("<pre><code>" + html.escape("\n".join(code_buffer)) + "</code></pre>")
+                code_buffer = []
+                in_code = False
+            else:
+                in_code = True
+            continue
+        if in_code:
+            code_buffer.append(line)
+            continue
         if not stripped:
             flush_paragraph()
             close_list()
+            flush_table()
             continue
+        if stripped.count("|") >= 2 and (
+            stripped.startswith("|") or is_table_separator(stripped) or table_buffer
+        ):
+            flush_paragraph()
+            close_list()
+            table_buffer.append(stripped)
+            continue
+        flush_table()
         heading = re.match(r"^(#{1,4})\s+(.+)$", stripped)
         if heading:
             flush_paragraph()
             close_list()
             level = len(heading.group(1))
-            parts.append(f"<h{level}>{html.escape(heading.group(2))}</h{level}>")
+            parts.append(f"<h{level}>{inline_markup(heading.group(2))}</h{level}>")
             continue
         if stripped.startswith("<figure>"):
             flush_paragraph()
             close_list()
             parts.append(stripped)
             continue
-        bullet = re.match(r"^[-*]\s+(.+)$", stripped)
+        bullet = re.match(r"^[-*+]\s+(.+)$", stripped)
         if bullet:
             flush_paragraph()
             if not in_list:
                 parts.append("<ul>")
                 in_list = True
-            parts.append(f"<li>{html.escape(bullet.group(1))}</li>")
+            parts.append(f"<li>{inline_markup(bullet.group(1))}</li>")
+            continue
+        quoted = re.match(r"^>\s*(.+)$", stripped)
+        if quoted:
+            flush_paragraph()
+            close_list()
+            parts.append(f"<blockquote>{inline_markup(quoted.group(1))}</blockquote>")
             continue
         paragraph.append(stripped)
+    if in_code and code_buffer:
+        parts.append("<pre><code>" + html.escape("\n".join(code_buffer)) + "</code></pre>")
     flush_paragraph()
     close_list()
+    flush_table()
     return "\n".join(parts)
 
 
@@ -904,20 +988,41 @@ def html_document(title: str, body: str) -> str:
     table {{
       width: 100%;
       border-collapse: collapse;
-      margin: 18px 0;
-      font-size: 14px;
+      margin: 20px 0;
+      font-size: 15px;
+      table-layout: fixed;
+      word-break: break-word;
     }}
     th, td {{
       border: 1px solid var(--line);
-      padding: 8px 10px;
+      padding: 10px 13px;
       vertical-align: top;
+      line-height: 1.66;
     }}
-    th {{ background: var(--soft); }}
+    th {{
+      background: var(--accent);
+      color: #ffffff;
+      font-weight: 600;
+      text-align: left;
+      white-space: nowrap;
+    }}
+    tbody tr:nth-child(even) {{ background: #fafbfc; }}
+    td:first-child {{ font-weight: 600; color: #23384a; }}
     code {{
       background: var(--soft);
       padding: 1px 5px;
       border-radius: 4px;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 0.92em;
     }}
+    pre {{
+      background: var(--soft);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 14px 16px;
+      overflow-x: auto;
+    }}
+    pre code {{ background: none; padding: 0; }}
     figure {{
       margin: 24px 0;
       padding: 14px;
@@ -936,10 +1041,25 @@ def html_document(title: str, body: str) -> str:
       color: var(--muted);
       font-size: 14px;
     }}
+    .table-wrap {{
+      width: 100%;
+      overflow-x: auto;
+      margin: 20px 0;
+    }}
+    .table-wrap table {{ margin: 0; min-width: 520px; }}
     @media (max-width: 720px) {{
       main {{ margin: 0; padding: 24px 18px; }}
       h1 {{ font-size: 24px; }}
       h2 {{ font-size: 20px; }}
+      table {{ font-size: 14px; }}
+      th {{ white-space: normal; }}
+      .table-wrap table {{ min-width: 440px; }}
+    }}
+    @media print {{
+      body {{ background: #ffffff; }}
+      main {{ box-shadow: none; margin: 0; padding: 0; }}
+      h2 {{ page-break-after: avoid; }}
+      table, figure {{ page-break-inside: avoid; }}
     }}
   </style>
 </head>
@@ -1109,7 +1229,7 @@ def prepare_folder(folder: Path, vault: Path = DEFAULT_VAULT, extract_auto_image
             [
                 "# Agent Task",
                 "",
-                "请使用当前 Codex/Claude Agent 直接生成中文深读 Markdown，不要调用 DeepSeek API。",
+                "请使用当前 Agent 直接生成中文深读 Markdown，不调用任何外部模型 API。",
                 "",
                 f"- Text packet: `{packet_path}`",
                 f"- Auto visual assets: `{visual_dir}`" if auto_manifest else "- Auto visual assets: 未生成",
@@ -1420,7 +1540,7 @@ def main() -> int:
     parser.add_argument("--process-all", action="store_true")
     parser.add_argument("--refresh-assets", type=Path, default=None, help="Refresh copied image assets for one folder")
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--model", choices=["auto", "deepseek", "claude"], default="auto")
+    parser.add_argument("--model", choices=["auto", "claude"], default="auto")
     args = parser.parse_args()
 
     if args.scan or (not args.prepare and not args.finalize and not args.process and not args.process_all and not args.refresh_assets):

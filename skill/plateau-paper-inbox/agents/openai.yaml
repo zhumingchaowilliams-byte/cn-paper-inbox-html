@@ -1,0 +1,4 @@
+interface:
+  display_name: "珠峰文献投递箱"
+  short_description: "把论文 PDF 与补充材料转成中文深读笔记与可分享 HTML"
+  default_prompt: "处理 inbox 中按固定命名放置的正文 PDF 和补充材料，抽取并裁剪 PDF 图区，生成含技术路线图、逐图实验卡片与方法细读的结构化中文深读笔记与 HTML。"

@@ -753,6 +753,7 @@ def markdown_to_html(markdown_text: str, title: str, html_path: Path, vault: Pat
         return f'<figure><img src="{html.escape(src)}" alt="{html.escape(alt)}"><figcaption>{html.escape(alt)}</figcaption></figure>'
 
     converted = re.sub(r"!\[\[([^\]]+)\]\]", convert_obsidian_image, markdown_text)
+    converted, block_placeholders = extract_fenced_svg(converted)
     body = None
     try:
         import markdown  # type: ignore
@@ -766,8 +767,39 @@ def markdown_to_html(markdown_text: str, title: str, html_path: Path, vault: Pat
         print(f"警告：markdown 渲染失败（{exc}），已回退到内置渲染器。", file=sys.stderr)
     if body is None:
         body = fallback_markdown_to_html(converted)
+    body = restore_inline_blocks(body, block_placeholders)
     body = wrap_tables(body)
     return html_document(title, body)
+
+
+INLINE_BLOCK_TEMPLATE = "@@CPIBLOCK{index}@@"
+
+
+def extract_fenced_svg(markdown_text: str) -> tuple[str, dict[str, str]]:
+    """Pull ```svg fenced blocks out before Markdown rendering.
+
+    The Markdown renderer escapes raw HTML inside code blocks, so inline SVG
+    must be lifted out first and put back into the rendered document verbatim.
+    """
+    blocks: dict[str, str] = {}
+
+    def replace(match: re.Match[str]) -> str:
+        index = len(blocks)
+        key = INLINE_BLOCK_TEMPLATE.format(index=index)
+        blocks[key] = match.group(1).strip()
+        return f"\n{key}\n"
+
+    pattern = re.compile(r"```svg[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE)
+    return pattern.sub(replace, markdown_text), blocks
+
+
+def restore_inline_blocks(body: str, blocks: dict[str, str]) -> str:
+    for key, svg in blocks.items():
+        if f"<p>{key}</p>" in body:
+            body = body.replace(f"<p>{key}</p>", f'<div class="svg-figure">{svg}</div>')
+        else:
+            body = body.replace(key, f'<div class="svg-figure">{svg}</div>')
+    return body
 
 
 def wrap_tables(body: str) -> str:
@@ -839,7 +871,11 @@ def fallback_markdown_to_html(markdown_text: str) -> str:
     def flush_paragraph() -> None:
         nonlocal paragraph
         if paragraph:
-            parts.append("<p>" + inline_markup(" ".join(paragraph)) + "</p>")
+            joined = " ".join(paragraph)
+            if joined.startswith("@@CPIBLOCK"):
+                parts.append(joined)
+            else:
+                parts.append("<p>" + inline_markup(joined) + "</p>")
             paragraph = []
 
     def close_list() -> None:
@@ -981,11 +1017,32 @@ def html_document(title: str, body: str) -> str:
       display: block;
       padding: 14px 18px 14px 22px;
       margin: 4px 0;
-      background: #eef4f2;
-      border-left: 5px solid var(--accent);
-      color: #0f3f39;
+      background: #fdf3e3;
+      border-left: 5px solid #c17d1a;
+      color: #7a4a06;
+      font-weight: 600;
       font-size: 16.5px;
       line-height: 1.8;
+    }}
+    h2 + p > strong:only-child {{
+      margin-top: 0;
+      background: #eef4f2;
+      border-left-color: var(--accent);
+      color: #0f3f39;
+    }}
+    .svg-figure {{
+      margin: 24px 0;
+      padding: 18px 14px;
+      background: var(--soft);
+      border: 1px solid var(--line);
+      overflow-x: auto;
+    }}
+    .svg-figure svg {{
+      display: block;
+      width: 100%;
+      max-width: 900px;
+      height: auto;
+      margin: 0 auto;
     }}
     ul, ol {{ padding-left: 1.4em; }}
     blockquote {{
@@ -1069,7 +1126,7 @@ def html_document(title: str, body: str) -> str:
       body {{ background: #ffffff; }}
       main {{ box-shadow: none; margin: 0; padding: 0; }}
       h2 {{ page-break-after: avoid; }}
-      table, figure {{ page-break-inside: avoid; }}
+      table, figure, .svg-figure {{ page-break-inside: avoid; }}
     }}
   </style>
 </head>
@@ -1257,24 +1314,23 @@ def prepare_folder(folder: Path, vault: Path = DEFAULT_VAULT, extract_auto_image
                 "```text",
                 "# 中文题目",
                 "## 文章简介",
-                "## 成果介绍",
                 "## 全文速览",
                 "## 图文导读",
                 "## 机制链条",
                 "## 方法细读",
                 "## 分析与思考",
                 "## 文章信息",
-                "## 人工核查清单",
                 "```",
                 "",
-                "- 文章简介 merges the one-sentence conclusion and keywords into one flowing paragraph.",
-                "- 成果介绍 uses two to four paragraphs, first paragraph in bold.",
-                "- 全文速览 lists section-by-section progress only, no repeated numbers.",
+                "- 文章简介 is the abstract and the key findings in one unit. Lead with the single most important judgement, weave in the concepts, methods and study objects, then add two to four short paragraphs of findings separated by blank lines. Put the two or three decisive numbers or conclusions in bold or in backticks; leave the rest as normal body text. Do not bold a whole paragraph.",
+                "- 全文速览 must render as one workflow diagram describing the paper's own structure, not a table. The research question goes into the opening stage, labelled as the problem. Write one ```svg code fence containing a self-designed SVG, viewBox starting with `0 0 680 `, landscape orientation, Chinese labels at 13px or larger. Lay it out left to right in three to six stages, each stage a solid rounded colour block with its sub-items in small cards beside or below it, dashed divider boxes grouping related stages, and a single large arrow between stages.",
                 "- 图文导读 gives each figure its own `### 图 N` heading, the embedded figure, the Chinese reading, then a three-column key-experiment table for that figure only.",
                 "- 机制链条 and 方法细读 follow, with 方法细读 allowed to be the most detailed section.",
                 "- 分析与思考 replaces any literature-review framing; write implications, transferable methods, gaps and limits only.",
+                "- Never mention missing data. Do not write that supplements were not provided, that certain supplementary figures are outside the local files, that data are available on request, or that any number needs re-verifying. Limits discussed by the authors themselves (for example single-season sampling) may be summarised, but only for what they mean for the reach of the conclusions.",
                 "- 文章信息 goes near the end and omits submission and acceptance dates.",
                 "- Do not add an image-asset listing section; figures belong in 图文导读.",
+                "- Do NOT write a 人工核查清单 section or any checklist of missing supplements, reproducibility risks or numbers to re-verify. The note ends with 文章信息.",
                 "",
                 "After writing the generated Markdown to a temporary file, run:",
                 "",
